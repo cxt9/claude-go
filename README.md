@@ -15,9 +15,22 @@
 
 ### Installation
 
-1. Download the latest release from [Releases](https://github.com/cxt9/claude-go/releases)
-2. Extract to your USB drive
-3. Run `./launch.sh` (macOS/Linux) or `launch.bat` (Windows)
+**On your USB drive:**
+
+```bash
+# 1. Clone directly to your USB
+cd /Volumes/MyUSB   # or /media/usb, or E:\ on Windows
+git clone https://github.com/cxt9/claude-go.git
+cd claude-go
+
+# 2. Run setup (builds the binary - requires Go installed)
+./setup.sh
+
+# 3. Start using it
+./launch.sh
+```
+
+That's it! Your USB is now a portable Claude Code environment.
 
 ### First-Time Setup
 
