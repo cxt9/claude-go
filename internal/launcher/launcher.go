@@ -418,21 +418,21 @@ func (app *App) setupOAuth() error {
 		return fmt.Errorf("failed to start callback server: %w", err)
 	}
 
-	// Get authorization URL
-	authURL, state, err := app.auth.StartOAuthFlow(ctx)
+	// Get authorization URL and flow data
+	flowData, err := app.auth.StartOAuthFlow(ctx)
 	if err != nil {
 		return err
 	}
 
 	// Open browser
-	if err := openBrowser(authURL); err != nil {
-		fmt.Printf("Please open this URL in your browser:\n%s\n", authURL)
+	if err := openBrowser(flowData.AuthURL); err != nil {
+		fmt.Printf("Please open this URL in your browser:\n%s\n", flowData.AuthURL)
 	}
 
 	// Wait for callback
 	select {
 	case code := <-codeChan:
-		if err := app.auth.CompleteOAuthFlow(ctx, code, state); err != nil {
+		if err := app.auth.CompleteOAuthFlow(ctx, code, flowData.CodeVerifier); err != nil {
 			return err
 		}
 		fmt.Println("✓ Authentication successful!")

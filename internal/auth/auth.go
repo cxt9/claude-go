@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -41,19 +42,29 @@ func NewAuthenticator(v *vault.Vault) *Authenticator {
 	return &Authenticator{vault: v}
 }
 
-// StartOAuthFlow initiates the OAuth flow and returns the authorization URL
-func (a *Authenticator) StartOAuthFlow(ctx context.Context) (string, string, error) {
+// OAuthFlowData contains the data needed to complete an OAuth flow
+type OAuthFlowData struct {
+	AuthURL      string
+	State        string
+	CodeVerifier string
+}
+
+// StartOAuthFlow initiates the OAuth flow and returns the authorization URL and flow data
+func (a *Authenticator) StartOAuthFlow(ctx context.Context) (*OAuthFlowData, error) {
 	// Generate state for CSRF protection
 	state, err := generateRandomString(32)
 	if err != nil {
-		return "", "", fmt.Errorf("failed to generate state: %w", err)
+		return nil, fmt.Errorf("failed to generate state: %w", err)
 	}
 
-	// Generate PKCE code verifier and challenge
+	// Generate PKCE code verifier (43-128 chars, URL-safe)
 	codeVerifier, err := generateRandomString(64)
 	if err != nil {
-		return "", "", fmt.Errorf("failed to generate code verifier: %w", err)
+		return nil, fmt.Errorf("failed to generate code verifier: %w", err)
 	}
+
+	// Generate S256 code challenge: BASE64URL(SHA256(code_verifier))
+	codeChallenge := generateS256Challenge(codeVerifier)
 
 	// Build authorization URL
 	params := url.Values{
@@ -61,20 +72,30 @@ func (a *Authenticator) StartOAuthFlow(ctx context.Context) (string, string, err
 		"redirect_uri":          {redirectURI},
 		"response_type":         {"code"},
 		"state":                 {state},
-		"code_challenge":        {codeVerifier}, // Simplified - would use S256
-		"code_challenge_method": {"plain"},      // Would use S256 in production
+		"code_challenge":        {codeChallenge},
+		"code_challenge_method": {"S256"},
 		"scope":                 {"claude:read claude:write"},
 	}
 
 	authURL := fmt.Sprintf("%s?%s", authorizationEndpoint, params.Encode())
 
-	return authURL, state, nil
+	return &OAuthFlowData{
+		AuthURL:      authURL,
+		State:        state,
+		CodeVerifier: codeVerifier,
+	}, nil
+}
+
+// generateS256Challenge creates a PKCE S256 code challenge from a verifier
+func generateS256Challenge(verifier string) string {
+	hash := sha256.Sum256([]byte(verifier))
+	return base64.RawURLEncoding.EncodeToString(hash[:])
 }
 
 // CompleteOAuthFlow exchanges the authorization code for tokens
-func (a *Authenticator) CompleteOAuthFlow(ctx context.Context, code string, state string) error {
+func (a *Authenticator) CompleteOAuthFlow(ctx context.Context, code string, codeVerifier string) error {
 	// Exchange code for tokens
-	tokens, err := a.exchangeCodeForTokens(ctx, code)
+	tokens, err := a.exchangeCodeForTokens(ctx, code, codeVerifier)
 	if err != nil {
 		return fmt.Errorf("token exchange failed: %w", err)
 	}
@@ -202,16 +223,32 @@ type TokenResponse struct {
 	Scope        string `json:"scope"`
 }
 
-func (a *Authenticator) exchangeCodeForTokens(ctx context.Context, code string) (*TokenResponse, error) {
-	// This would make an actual HTTP request to the token endpoint
-	// For now, return a placeholder
-	return &TokenResponse{
-		AccessToken:  "placeholder_access_token",
-		RefreshToken: "placeholder_refresh_token",
-		TokenType:    "Bearer",
-		ExpiresIn:    3600,
-		Scope:        "claude:read claude:write",
-	}, nil
+func (a *Authenticator) exchangeCodeForTokens(ctx context.Context, code string, codeVerifier string) (*TokenResponse, error) {
+	// Build token request with PKCE code_verifier
+	data := url.Values{
+		"grant_type":    {"authorization_code"},
+		"client_id":     {clientID},
+		"code":          {code},
+		"redirect_uri":  {redirectURI},
+		"code_verifier": {codeVerifier},
+	}
+
+	resp, err := http.PostForm(tokenEndpoint, data)
+	if err != nil {
+		return nil, fmt.Errorf("token request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("token endpoint returned status %d", resp.StatusCode)
+	}
+
+	var tokens TokenResponse
+	if err := json.NewDecoder(resp.Body).Decode(&tokens); err != nil {
+		return nil, fmt.Errorf("failed to parse token response: %w", err)
+	}
+
+	return &tokens, nil
 }
 
 func (a *Authenticator) refreshToken(provider Provider, refreshToken string) error {
