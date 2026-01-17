@@ -1,0 +1,267 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (e.g., 1.0.0)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: darwin
+            goarch: arm64
+            platform: darwin-arm64
+          - goos: darwin
+            goarch: amd64
+            platform: darwin-amd64
+          - goos: linux
+            goarch: amd64
+            platform: linux-amd64
+          - goos: windows
+            goarch: amd64
+            platform: windows-amd64
+            ext: .exe
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Get version
+        id: version
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+          else
+            echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          mkdir -p dist/bin/${{ matrix.platform }}
+          go build -ldflags "-s -w -X main.Version=${{ steps.version.outputs.version }}" \
+            -o dist/bin/${{ matrix.platform }}/claude-go${{ matrix.ext }} \
+            ./cmd/claude-go
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.platform }}
+          path: dist/bin/${{ matrix.platform }}/
+
+  package:
+    name: Package
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Get version
+        id: version
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+          else
+            echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create release packages
+        run: |
+          VERSION=${{ steps.version.outputs.version }}
+          mkdir -p release
+
+          # Create base structure
+          mkdir -p base/{config,vault,sessions,cache,mcp/bundled,mcp/user}
+
+          # Copy scripts
+          cp scripts/launch.sh scripts/launch.bat base/
+          cp scripts/update.sh scripts/update.bat base/
+          chmod +x base/*.sh
+
+          # Create default config
+          cat > base/config/settings.json << 'EOF'
+          {
+            "version": "1.0",
+            "vault": {
+              "auto_lock_minutes": 15,
+              "require_password_on_resume": true
+            },
+            "sessions": {
+              "cleanup_period_days": 30,
+              "max_sessions": 100,
+              "auto_save_seconds": 30
+            },
+            "environment": {
+              "paranoid_mode": false,
+              "cleanup_on_exit": true,
+              "default_model": "claude-sonnet-4-20250514"
+            },
+            "updates": {
+              "auto_check": true,
+              "channel": "stable"
+            },
+            "mcp": {
+              "servers": {}
+            }
+          }
+          EOF
+
+          # Create version file
+          echo "{\"version\":\"${VERSION}\",\"built_at\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}" > base/.version
+
+          # Create README
+          cat > base/README.md << 'EOF'
+          # Claude Code Go
+
+          Portable Claude Code environment for use on any machine.
+
+          ## Quick Start
+
+          1. Run `./launch.sh` (macOS/Linux) or `launch.bat` (Windows)
+          2. Create your master password
+          3. Authenticate with Claude
+          4. Start coding!
+
+          ## Updates
+
+          Run `./update.sh` (macOS/Linux) or `update.bat` (Windows) to check for updates.
+
+          ## Security
+
+          Your credentials are encrypted with AES-256. Never share your master password.
+          If you lose your USB device, revoke access at https://claude.ai/settings
+          EOF
+
+          # Create platform-specific packages
+          for platform in darwin-arm64 darwin-amd64 linux-amd64 windows-amd64; do
+            echo "Creating package for ${platform}..."
+
+            pkg_dir="release/claude-go-${VERSION}"
+            rm -rf "$pkg_dir"
+            cp -r base "$pkg_dir"
+
+            # Copy binary
+            mkdir -p "${pkg_dir}/bin/${platform}"
+            cp -r artifacts/binary-${platform}/* "${pkg_dir}/bin/${platform}/"
+
+            # Create zip
+            cd release
+            zip -r "claude-go-${VERSION}-${platform}.zip" "claude-go-${VERSION}"
+            cd ..
+
+            # Calculate SHA256
+            sha256sum "release/claude-go-${VERSION}-${platform}.zip" | cut -d' ' -f1 > "release/claude-go-${VERSION}-${platform}.zip.sha256"
+
+            rm -rf "$pkg_dir"
+          done
+
+          # Create full package (all platforms)
+          echo "Creating full package..."
+          pkg_dir="release/claude-go-${VERSION}"
+          cp -r base "$pkg_dir"
+
+          for platform in darwin-arm64 darwin-amd64 linux-amd64 windows-amd64; do
+            mkdir -p "${pkg_dir}/bin/${platform}"
+            cp -r artifacts/binary-${platform}/* "${pkg_dir}/bin/${platform}/"
+          done
+
+          cd release
+          zip -r "claude-go-${VERSION}-all-platforms.zip" "claude-go-${VERSION}"
+          sha256sum "claude-go-${VERSION}-all-platforms.zip" | cut -d' ' -f1 > "claude-go-${VERSION}-all-platforms.zip.sha256"
+          cd ..
+
+          rm -rf "$pkg_dir"
+
+          # Create manifest
+          cat > release/manifest.json << EOF
+          {
+            "version": "${VERSION}",
+            "release_date": "$(date -u +%Y-%m-%d)",
+            "changelog": [
+              "See release notes for details"
+            ],
+            "downloads": {
+              "darwin-arm64": {
+                "url": "https://github.com/cxt9/claude-go/releases/download/v${VERSION}/claude-go-${VERSION}-darwin-arm64.zip",
+                "sha256": "$(cat release/claude-go-${VERSION}-darwin-arm64.zip.sha256)",
+                "size": $(stat -c%s release/claude-go-${VERSION}-darwin-arm64.zip)
+              },
+              "darwin-amd64": {
+                "url": "https://github.com/cxt9/claude-go/releases/download/v${VERSION}/claude-go-${VERSION}-darwin-amd64.zip",
+                "sha256": "$(cat release/claude-go-${VERSION}-darwin-amd64.zip.sha256)",
+                "size": $(stat -c%s release/claude-go-${VERSION}-darwin-amd64.zip)
+              },
+              "linux-amd64": {
+                "url": "https://github.com/cxt9/claude-go/releases/download/v${VERSION}/claude-go-${VERSION}-linux-amd64.zip",
+                "sha256": "$(cat release/claude-go-${VERSION}-linux-amd64.zip.sha256)",
+                "size": $(stat -c%s release/claude-go-${VERSION}-linux-amd64.zip)
+              },
+              "windows-amd64": {
+                "url": "https://github.com/cxt9/claude-go/releases/download/v${VERSION}/claude-go-${VERSION}-windows-amd64.zip",
+                "sha256": "$(cat release/claude-go-${VERSION}-windows-amd64.zip.sha256)",
+                "size": $(stat -c%s release/claude-go-${VERSION}-windows-amd64.zip)
+              }
+            }
+          }
+          EOF
+
+      - name: Upload release packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-packages
+          path: release/
+
+  release:
+    name: Release
+    needs: package
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+
+    steps:
+      - name: Download packages
+        uses: actions/download-artifact@v4
+        with:
+          name: release-packages
+          path: release
+
+      - name: Get version
+        id: version
+        run: echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/*.zip
+            release/manifest.json
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
